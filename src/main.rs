@@ -1,3 +1,4 @@
+#![feature(let_else)]
 mod lsp;
 
 use std::path::{Path, PathBuf};
@@ -106,31 +107,23 @@ impl MainContext {
 
         let mut read = BufReader::new(read);
 
-        let root = match lsp::Message::read(&mut read).await? {
-            Some(lsp::Message::Request(req)) if req.method == "intialize" => {
-                // TODO: better error handling
-                req.params
-                    .as_object()
-                    .unwrap()
-                    .get("rootPath")
-                    .unwrap()
-                    .as_str()
-                    .unwrap()
-                    .to_string()
-            }
-            _ => {
-                println!("didnot get initialize request");
-                return Ok(());
-            }
+        let Some(init) = lsp::Message::read(&mut read).await? else {
+            println!("no init message");
+            return Ok(());
         };
-        let root = Path::new(&root).canonicalize()?;
+
+        let Some(root) = lsp::get_root_path(&init) else {
+            println!("no root path");
+            return Ok(());
+        };
+
         let server = self.find_or_make_server(&root).await?;
         let client = Client {
             id,
             write: Mutex::new(write),
         };
         server.attach_client(client).await;
-
+        server.handle_client_message(init).await?;
         Ok(())
     }
 }

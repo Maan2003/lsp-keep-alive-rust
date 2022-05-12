@@ -3,10 +3,33 @@
 use std::{
     fmt,
     io::{self, Write},
+    path::PathBuf,
 };
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
+
+// extract the rootPath from the intialize request
+pub fn get_root_path(init: &Message) -> Option<PathBuf> {
+    let root = match init {
+        Message::Request(req) if req.method == "intialize" => {
+            // TODO: better error handling
+            req.params
+                .as_object()
+                .unwrap()
+                .get("rootPath")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string()
+        }
+        _ => {
+            println!("didnot get initialize request");
+            return None;
+        }
+    };
+    Some(PathBuf::from(root))
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(untagged)]
