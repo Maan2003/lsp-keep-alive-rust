@@ -43,6 +43,8 @@ impl Server {
             request_id_to_original: HashMap::new(),
         }));
 
+        tokio::spawn(Self::handle_server_output(this.clone(), child.stdout.take().unwrap()));
+
         Ok(this)
     }
 
