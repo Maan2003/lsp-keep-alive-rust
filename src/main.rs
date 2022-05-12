@@ -10,7 +10,7 @@ use tokio::fs;
 use tokio::io::BufReader;
 
 use tokio::net::{tcp::OwnedWriteHalf, TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
 
 pub struct MainContext {
     servers: Mutex<Vec<Arc<Mutex<Server>>>>,
@@ -18,10 +18,12 @@ pub struct MainContext {
 
 pub struct Server {
     stdin: tokio::process::ChildStdin,
+    child: tokio::process::Child,
     root: PathBuf,
     clients: Vec<Client>,
     request_id_to_original: HashMap<RequestId, ClientRequestId>,
     initialize_response: Option<lsp::Message>,
+    cancel_shutdown: Option<oneshot::Sender<()>>,
 }
 
 pub struct ClientRequestId {
@@ -36,22 +38,28 @@ impl Server {
         process.stdout(std::process::Stdio::piped());
         let mut child = process.spawn()?;
         let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
         // TODO: consider using a buffered writer
         let this = Arc::new(Mutex::new(Self {
             stdin,
             root,
+            child,
             clients: Vec::new(),
             request_id_to_original: HashMap::new(),
             initialize_response: None,
+            cancel_shutdown: None,
         }));
 
-        tokio::spawn(Self::handle_server_output(this.clone(), child.stdout.take().unwrap()));
+        tokio::spawn(Self::handle_server_output(this.clone(), stdout));
 
         Ok(this)
     }
 
     pub fn attach_client(&mut self, client: Client) {
         self.clients.push(client);
+        if let Some(cancel_shutdown) = self.cancel_shutdown.take() {
+            cancel_shutdown.send(()).unwrap();
+        }
     }
 
     pub async fn handle_server_output(
@@ -99,6 +107,39 @@ impl Server {
         Ok(())
     }
 
+    pub async fn handle_disconnect(
+        this: Arc<Mutex<Self>>,
+        main_ctx: Arc<MainContext>,
+        client_id: usize,
+    ) {
+        let mut this_lock = this.lock().await;
+        this_lock.clients.retain(|client| client.id != client_id);
+        this_lock
+            .request_id_to_original
+            .retain(|_, v| v.client_id != client_id);
+
+        if this_lock.clients.is_empty() {
+            println!("no more clients, shutting down");
+            // schedule shutdown
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            this_lock.cancel_shutdown = Some(tx);
+            drop(this_lock);
+            tokio::spawn(async move {
+                let sleep = tokio::time::sleep(std::time::Duration::from_secs(20 * 60));
+                tokio::select! {
+                    _ = sleep => {
+                        println!("shutting down");
+                        this.lock().await.child.kill().await.ok();
+                        main_ctx.servers.lock().await.retain(|s| !Arc::ptr_eq(s, &this));
+                    },
+                    _ = rx => {
+                        println!("shutdown cancelled");
+                    }
+                };
+            });
+        }
+    }
+
     pub fn get_next_id(&mut self, client_id: usize) -> RequestId {
         static NEXT_ID: AtomicI32 = AtomicI32::new(0);
         NEXT_ID.fetch_add(1, Ordering::SeqCst).into()
@@ -110,26 +151,22 @@ impl Server {
         mut message: lsp::Message,
     ) -> io::Result<()> {
         println!("client #{client_id}: {message:?}");
-        if matches!(&message, lsp::Message::Notification(lsp::Notification { method, .. }) if method == "exit") {
-            // suppress exit notification
-            return Ok(());
-        }
-
         if let lsp::Message::Request(req) = &mut message {
-            if req.method == "shutdown" {
-                return Ok(());
-            }
             let request_id = self.get_next_id(client_id);
-            self.request_id_to_original.insert(request_id.clone(), ClientRequestId {
-                client_id,
-                request_id: req.id.clone(),
-            });
+            self.request_id_to_original.insert(
+                request_id.clone(),
+                ClientRequestId {
+                    client_id,
+                    request_id: req.id.clone(),
+                },
+            );
             req.id = request_id;
         }
         message.write(&mut self.stdin).await
     }
 }
 
+#[derive(Debug)]
 pub struct Client {
     id: usize,
     write: OwnedWriteHalf,
@@ -205,6 +242,31 @@ impl MainContext {
             }
         }
         while let Some(message) = lsp::Message::read(&mut read).await? {
+            match message {
+                lsp::Message::Request(req) if req.method == "shutdown" => {
+                    println!("client #{client_id}: shutdown request");
+                    let mut server = server.lock().await;
+                    let msg = lsp::Message::Response(lsp::Response {
+                        id: req.id,
+                        result: Some(serde_json::json!(null)),
+                        error: None,
+                    });
+                    let client = server
+                        .clients
+                        .iter_mut()
+                        .find(|client| client.id == client_id)
+                        .unwrap();
+                    client.send_message(&msg).await.ok();
+                    continue;
+                }
+                lsp::Message::Notification(notif) if notif.method == "exit" => {
+                    println!("client #{client_id}: exited");
+                    Server::handle_disconnect(server, self.clone(), client_id).await;
+                    drop(read);
+                    break;
+                }
+                _ => {}
+            }
             let mut server = server.lock().await;
             server.handle_client_message(client_id, message).await?;
         }
