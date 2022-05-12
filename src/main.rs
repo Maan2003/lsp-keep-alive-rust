@@ -4,10 +4,10 @@ mod lsp;
 use lsp::RequestId;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::{io, sync::Arc};
 use tokio::fs;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::BufReader;
 
 use tokio::net::{tcp::OwnedWriteHalf, TcpListener, TcpStream};
 use tokio::sync::Mutex;
@@ -20,7 +20,12 @@ pub struct Server {
     stdin: tokio::process::ChildStdin,
     root: PathBuf,
     clients: Vec<Client>,
-    request_to_client: HashMap<RequestId, usize>,
+    request_id_to_original: HashMap<RequestId, ClientRequestId>,
+}
+
+pub struct ClientRequestId {
+    client_id: usize,
+    request_id: RequestId,
 }
 
 impl Server {
@@ -35,7 +40,7 @@ impl Server {
             stdin,
             root,
             clients: Vec::new(),
-            request_to_client: HashMap::new(),
+            request_id_to_original: HashMap::new(),
         }));
 
         Ok(this)
@@ -56,10 +61,18 @@ impl Server {
         Ok(())
     }
 
-    pub async fn handle_server_message(&mut self, message: lsp::Message) -> io::Result<()> {
-        let client_id = match &message {
+    pub async fn handle_server_message(&mut self, mut message: lsp::Message) -> io::Result<()> {
+        let client_id = match &mut message {
             lsp::Message::Request(_) | lsp::Message::Notification(_) => None,
-            lsp::Message::Response(res) => self.request_to_client.remove(&res.id),
+            lsp::Message::Response(res) => {
+                let orig_req = self.request_id_to_original.remove(&res.id);
+                if let Some(orig_req) = orig_req {
+                    res.id = orig_req.request_id;
+                    Some(orig_req.client_id)
+                } else {
+                    None
+                }
+            }
         };
 
         if let Some(client_id) = client_id {
@@ -77,7 +90,31 @@ impl Server {
         Ok(())
     }
 
-    pub async fn handle_client_message(&mut self, message: lsp::Message) -> io::Result<()> {}
+    pub fn get_next_id(&mut self, client_id: usize) -> RequestId {
+        static NEXT_ID: AtomicI32 = AtomicI32::new(0);
+        let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+        let request_id = RequestId::from(id);
+        self.request_id_to_original.insert(
+            request_id.clone(),
+            ClientRequestId {
+                client_id,
+                request_id: request_id.clone(),
+            },
+        );
+        request_id
+    }
+
+    pub async fn handle_client_message(
+        &mut self,
+        client_id: usize,
+        mut message: lsp::Message,
+    ) -> io::Result<()> {
+        if let lsp::Message::Request(req) = &mut message {
+            let request_id = self.get_next_id(client_id);
+            req.id = request_id;
+        }
+        message.write(&mut self.stdin).await
+    }
 }
 
 pub struct Client {
@@ -121,7 +158,7 @@ impl MainContext {
 
     async fn handle_client(self: Arc<Self>, socket: TcpStream) -> io::Result<()> {
         static CLIENT_ID: AtomicUsize = AtomicUsize::new(0);
-        let id = CLIENT_ID.fetch_add(1, Ordering::SeqCst);
+        let client_id = CLIENT_ID.fetch_add(1, Ordering::SeqCst);
 
         let (read, write) = socket.into_split();
 
@@ -138,11 +175,14 @@ impl MainContext {
         };
 
         let server = self.find_or_make_server(&root).await?;
-        let client = Client { id, write };
+        let client = Client {
+            id: client_id,
+            write,
+        };
         {
             let mut server = server.lock().await;
             server.attach_client(client);
-            server.handle_client_message(init).await?;
+            server.handle_client_message(client_id, init).await?;
         }
         Ok(())
     }
