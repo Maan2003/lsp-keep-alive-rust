@@ -8,7 +8,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWr
 // extract the rootPath from the intialize request
 pub fn get_root_path(init: &Message) -> Option<PathBuf> {
     let root = match init {
-        Message::Request(req) if req.method == "intialize" => {
+        Message::Request(req) if req.method == "initialize" => {
             // TODO: better error handling
             req.params
                 .as_object()
