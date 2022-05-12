@@ -80,7 +80,7 @@ impl Server {
             lsp::Message::Response(res) => {
                 let orig_req = self.request_id_to_original.remove(&res.id);
                 if let Some(orig_req) = orig_req {
-                    res.id = dbg!(orig_req.request_id);
+                    res.id = orig_req.request_id;
                     Some(orig_req.client_id)
                 } else {
                     None
@@ -193,14 +193,16 @@ impl MainContext {
         }
     }
 
-    async fn find_or_make_server(self: Arc<Self>, root: &Path) -> io::Result<Arc<Mutex<Server>>> {
+    async fn find_or_make_server(&self, root: &Path) -> io::Result<Arc<Mutex<Server>>> {
         let root = fs::canonicalize(root).await?;
         let mut servers = self.servers.lock().await;
         for server in &*servers {
             if server.lock().await.root == root {
+                println!("found server for {}", root.display());
                 return Ok(server.clone());
             }
         }
+        println!("spawning server for {}", root.display());
         let server = Server::new(root)?;
         servers.push(server.clone());
         Ok(server)
@@ -225,7 +227,6 @@ impl MainContext {
             return Ok(());
         };
 
-        println!("intialized root: {}", root.display());
         let server = self.find_or_make_server(&root).await?;
         let mut client = Client {
             id: client_id,
