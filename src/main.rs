@@ -101,16 +101,7 @@ impl Server {
 
     pub fn get_next_id(&mut self, client_id: usize) -> RequestId {
         static NEXT_ID: AtomicI32 = AtomicI32::new(0);
-        let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
-        let request_id = RequestId::from(id);
-        self.request_id_to_original.insert(
-            request_id.clone(),
-            ClientRequestId {
-                client_id,
-                request_id: request_id.clone(),
-            },
-        );
-        request_id
+        NEXT_ID.fetch_add(1, Ordering::SeqCst).into()
     }
 
     pub async fn handle_client_message(
@@ -121,6 +112,10 @@ impl Server {
         println!("client msg: {message:?}");
         if let lsp::Message::Request(req) = &mut message {
             let request_id = self.get_next_id(client_id);
+            self.request_id_to_original.insert(request_id.clone(), ClientRequestId {
+                client_id,
+                request_id: req.id.clone(),
+            });
             req.id = request_id;
         }
         message.write(&mut self.stdin).await
