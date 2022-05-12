@@ -60,9 +60,9 @@ impl Server {
     ) -> io::Result<()> {
         let mut reader = BufReader::new(stdout);
         while let Some(line) = lsp::Message::read(&mut reader).await? {
-            println!("{line:?}");
             this.lock().await.handle_server_message(line).await.ok();
         }
+        println!("server exited");
         Ok(())
     }
 
@@ -109,8 +109,16 @@ impl Server {
         client_id: usize,
         mut message: lsp::Message,
     ) -> io::Result<()> {
-        println!("client msg: {message:?}");
+        println!("client #{client_id}: {message:?}");
+        if matches!(&message, lsp::Message::Notification(lsp::Notification { method, .. }) if method == "exit") {
+            // suppress exit notification
+            return Ok(());
+        }
+
         if let lsp::Message::Request(req) = &mut message {
+            if req.method == "shutdown" {
+                return Ok(());
+            }
             let request_id = self.get_next_id(client_id);
             self.request_id_to_original.insert(request_id.clone(), ClientRequestId {
                 client_id,
