@@ -58,6 +58,7 @@ impl Server {
     ) -> io::Result<()> {
         let mut reader = BufReader::new(stdout);
         while let Some(line) = lsp::Message::read(&mut reader).await? {
+            println!("{line:?}");
             this.lock().await.handle_server_message(line).await.ok();
         }
         Ok(())
@@ -69,7 +70,7 @@ impl Server {
             lsp::Message::Response(res) => {
                 let orig_req = self.request_id_to_original.remove(&res.id);
                 if let Some(orig_req) = orig_req {
-                    res.id = orig_req.request_id;
+                    res.id = dbg!(orig_req.request_id);
                     Some(orig_req.client_id)
                 } else {
                     None
@@ -111,6 +112,7 @@ impl Server {
         client_id: usize,
         mut message: lsp::Message,
     ) -> io::Result<()> {
+        println!("client msg: {message:?}");
         if let lsp::Message::Request(req) = &mut message {
             let request_id = self.get_next_id(client_id);
             req.id = request_id;
@@ -161,6 +163,7 @@ impl MainContext {
     async fn handle_client(self: Arc<Self>, socket: TcpStream) -> io::Result<()> {
         static CLIENT_ID: AtomicUsize = AtomicUsize::new(0);
         let client_id = CLIENT_ID.fetch_add(1, Ordering::SeqCst);
+        println!("connect client #{client_id}");
 
         let (read, write) = socket.into_split();
 
@@ -176,6 +179,7 @@ impl MainContext {
             return Ok(());
         };
 
+        println!("intialized root: {}", root.display());
         let server = self.find_or_make_server(&root).await?;
         let client = Client {
             id: client_id,
@@ -186,6 +190,11 @@ impl MainContext {
             server.attach_client(client);
             server.handle_client_message(client_id, init).await?;
         }
+        while let Some(message) = lsp::Message::read(&mut read).await? {
+            println!("client: {message:?}");
+            let mut server = server.lock().await;
+            server.handle_client_message(client_id, message).await?;
+        }
         Ok(())
     }
 }
@@ -193,7 +202,5 @@ impl MainContext {
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let main_context = MainContext::new().await;
-    let join_handle = tokio::spawn(main_context.tcp_server());
-    join_handle.await??;
-    Ok(())
+    main_context.tcp_server().await
 }
