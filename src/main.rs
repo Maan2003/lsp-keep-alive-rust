@@ -21,6 +21,7 @@ pub struct Server {
     root: PathBuf,
     clients: Vec<Client>,
     request_id_to_original: HashMap<RequestId, ClientRequestId>,
+    initialize_response: Option<lsp::Message>,
 }
 
 pub struct ClientRequestId {
@@ -41,6 +42,7 @@ impl Server {
             root,
             clients: Vec::new(),
             request_id_to_original: HashMap::new(),
+            initialize_response: None,
         }));
 
         tokio::spawn(Self::handle_server_output(this.clone(), child.stdout.take().unwrap()));
@@ -90,6 +92,10 @@ impl Server {
                 client.send_message(&message).await.ok();
             }
         }
+        if self.initialize_response.is_none() {
+            self.initialize_response = Some(message);
+        }
+
         Ok(())
     }
 
@@ -181,17 +187,21 @@ impl MainContext {
 
         println!("intialized root: {}", root.display());
         let server = self.find_or_make_server(&root).await?;
-        let client = Client {
+        let mut client = Client {
             id: client_id,
             write,
         };
         {
             let mut server = server.lock().await;
-            server.attach_client(client);
-            server.handle_client_message(client_id, init).await?;
+            if let Some(init) = &server.initialize_response {
+                client.send_message(init).await.ok();
+                server.attach_client(client);
+            } else {
+                server.attach_client(client);
+                server.handle_client_message(client_id, init).await.ok();
+            }
         }
         while let Some(message) = lsp::Message::read(&mut read).await? {
-            println!("client: {message:?}");
             let mut server = server.lock().await;
             server.handle_client_message(client_id, message).await?;
         }
