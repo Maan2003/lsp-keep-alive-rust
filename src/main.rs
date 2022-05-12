@@ -1,6 +1,8 @@
 #![feature(let_else)]
 mod lsp;
 
+use lsp::RequestId;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{io, sync::Arc};
@@ -11,64 +13,82 @@ use tokio::net::{tcp::OwnedWriteHalf, TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
 pub struct MainContext {
-    servers: Mutex<Vec<Arc<Server>>>,
+    servers: Mutex<Vec<Arc<Mutex<Server>>>>,
 }
 
 pub struct Server {
-    id: usize,
     stdin: tokio::process::ChildStdin,
     root: PathBuf,
-    clients: Mutex<Vec<Client>>,
+    clients: Vec<Client>,
+    request_to_client: HashMap<RequestId, usize>,
 }
 
 impl Server {
-    pub fn new(root: PathBuf) -> io::Result<Arc<Self>> {
-        static SERVER_ID: AtomicUsize = AtomicUsize::new(0);
-        let id = SERVER_ID.fetch_add(1, Ordering::SeqCst);
-
+    pub fn new(root: PathBuf) -> io::Result<Arc<Mutex<Self>>> {
         let mut process = tokio::process::Command::new("rust-analyzer");
         process.stdin(std::process::Stdio::piped());
         process.stdout(std::process::Stdio::piped());
         let mut child = process.spawn()?;
         let stdin = child.stdin.take().unwrap();
         // TODO: consider using a buffered writer
-        let this = Arc::new(Self {
-            id,
+        let this = Arc::new(Mutex::new(Self {
             stdin,
             root,
-            clients: Mutex::new(Vec::new()),
-        });
+            clients: Vec::new(),
+            request_to_client: HashMap::new(),
+        }));
 
         Ok(this)
     }
 
-    pub async fn attach_client(&self, client: Client) {
-        self.clients.lock().await.push(client);
+    pub fn attach_client(&mut self, client: Client) {
+        self.clients.push(client);
     }
 
     pub async fn handle_server_output(
-        self: Arc<Self>,
+        this: Arc<Mutex<Self>>,
         stdout: tokio::process::ChildStdout,
     ) -> io::Result<()> {
         let mut reader = BufReader::new(stdout);
         while let Some(line) = lsp::Message::read(&mut reader).await? {
-            self.handle_server_message(line).await?;
+            this.lock().await.handle_server_message(line).await.ok();
         }
         Ok(())
     }
 
-    pub async fn handle_server_message(&self, message: lsp::Message) -> io::Result<()> {
-        todo!()
+    pub async fn handle_server_message(&mut self, message: lsp::Message) -> io::Result<()> {
+        let client_id = match &message {
+            lsp::Message::Request(_) | lsp::Message::Notification(_) => None,
+            lsp::Message::Response(res) => self.request_to_client.remove(&res.id),
+        };
+
+        if let Some(client_id) = client_id {
+            for client in &mut self.clients {
+                if client.id == client_id {
+                    client.send_message(&message).await.ok();
+                    break;
+                }
+            }
+        } else {
+            for client in &mut self.clients {
+                client.send_message(&message).await.ok();
+            }
+        }
+        Ok(())
     }
 
-    pub async fn handle_client_message(&self, message: lsp::Message) -> io::Result<()> {
-        todo!()
-    }
+    pub async fn handle_client_message(&mut self, message: lsp::Message) -> io::Result<()> {}
 }
 
 pub struct Client {
     id: usize,
-    write: Mutex<OwnedWriteHalf>,
+    write: OwnedWriteHalf,
+}
+
+impl Client {
+    pub async fn send_message(&mut self, message: &lsp::Message) -> io::Result<()> {
+        message.write(&mut self.write).await
+    }
 }
 
 impl MainContext {
@@ -86,11 +106,11 @@ impl MainContext {
         }
     }
 
-    async fn find_or_make_server(self: Arc<Self>, root: &Path) -> io::Result<Arc<Server>> {
+    async fn find_or_make_server(self: Arc<Self>, root: &Path) -> io::Result<Arc<Mutex<Server>>> {
         let root = fs::canonicalize(root).await?;
         let mut servers = self.servers.lock().await;
         for server in &*servers {
-            if server.root == root {
+            if server.lock().await.root == root {
                 return Ok(server.clone());
             }
         }
@@ -100,8 +120,8 @@ impl MainContext {
     }
 
     async fn handle_client(self: Arc<Self>, socket: TcpStream) -> io::Result<()> {
-        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
-        let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+        static CLIENT_ID: AtomicUsize = AtomicUsize::new(0);
+        let id = CLIENT_ID.fetch_add(1, Ordering::SeqCst);
 
         let (read, write) = socket.into_split();
 
@@ -118,12 +138,12 @@ impl MainContext {
         };
 
         let server = self.find_or_make_server(&root).await?;
-        let client = Client {
-            id,
-            write: Mutex::new(write),
-        };
-        server.attach_client(client).await;
-        server.handle_client_message(init).await?;
+        let client = Client { id, write };
+        {
+            let mut server = server.lock().await;
+            server.attach_client(client);
+            server.handle_client_message(init).await?;
+        }
         Ok(())
     }
 }

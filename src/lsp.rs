@@ -1,13 +1,9 @@
 /// Taken and adapted from https://github.com/rust-analyzer/lsp-server
 /// available under the MIT or Apache 2.0 licenses.
-use std::{
-    fmt,
-    io::{self, Write},
-    path::PathBuf,
-};
+use std::{fmt, io, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 // extract the rootPath from the intialize request
 pub fn get_root_path(init: &Message) -> Option<PathBuf> {
@@ -178,21 +174,18 @@ impl Message {
         let msg = serde_json::from_str(&text)?;
         Ok(Some(msg))
     }
-    pub fn write(self, w: &mut impl Write) -> io::Result<()> {
-        self._write(w)
-    }
-    fn _write(self, w: &mut dyn Write) -> io::Result<()> {
+    pub async fn write(&self, w: &mut (impl AsyncWrite + Unpin)) -> io::Result<()> {
         #[derive(Serialize)]
-        struct JsonRpc {
+        struct JsonRpc<'a> {
             jsonrpc: &'static str,
             #[serde(flatten)]
-            msg: Message,
+            msg: &'a Message,
         }
         let text = serde_json::to_string(&JsonRpc {
             jsonrpc: "2.0",
-            msg: self,
+            msg: &self,
         })?;
-        write_msg_text(w, &text)
+        write_msg_text(w, &text).await
     }
 }
 
@@ -276,10 +269,11 @@ async fn read_msg_text(inp: &mut (impl AsyncBufRead + Unpin)) -> io::Result<Opti
     Ok(Some(buf))
 }
 
-fn write_msg_text(out: &mut dyn Write, msg: &str) -> io::Result<()> {
-    write!(out, "Content-Length: {}\r\n\r\n", msg.len())?;
-    out.write_all(msg.as_bytes())?;
-    out.flush()?;
+async fn write_msg_text(out: &mut (impl AsyncWrite + Unpin), msg: &str) -> io::Result<()> {
+    let header = format!("Content-Length: {}\r\n\r\n", msg.len());
+    out.write_all(header.as_bytes()).await?;
+    out.write_all(msg.as_bytes()).await?;
+    out.flush().await?;
     Ok(())
 }
 
