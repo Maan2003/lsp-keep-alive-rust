@@ -61,6 +61,12 @@ impl Server {
         })
     }
 
+    pub fn reuse(mut self) -> Self {
+        info!("reusing server");
+        self.cancel_shutdown.take().unwrap().send(()).unwrap();
+        self
+    }
+
     #[instrument(name = "Server::read_message", level = "trace", skip_all, ret)]
     pub async fn read_message(&mut self) -> io::Result<Option<lsp::Message>> {
         lsp::Message::read(&mut self.stdout).await
@@ -125,7 +131,7 @@ impl MainContext {
         let root = fs::canonicalize(root).await?;
         let mut servers = self.servers.lock().await;
         match servers.iter().position(|s| s.root == root) {
-            Some(idx) => Ok(servers.swap_remove(idx)),
+            Some(idx) => Ok(servers.swap_remove(idx).reuse()),
             None => Server::new(root),
         }
     }
