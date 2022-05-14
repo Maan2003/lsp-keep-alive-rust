@@ -43,7 +43,7 @@ pub struct ClientRequestId {
 }
 
 impl Server {
-    #[instrument]
+    #[instrument(name = "new server", level = "info")]
     pub fn new(root: PathBuf) -> io::Result<Arc<Mutex<Self>>> {
         let mut process = tokio::process::Command::new("rust-analyzer");
         process.stdin(std::process::Stdio::piped());
