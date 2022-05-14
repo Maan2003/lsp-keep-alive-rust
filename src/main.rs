@@ -218,9 +218,11 @@ impl MainContext {
 
     async fn tcp_server(self: Arc<Self>) -> io::Result<()> {
         let listener = TcpListener::bind("127.0.0.1:6969").await?;
+        let mut client_id = 0;
         loop {
             let (socket, _) = listener.accept().await?;
-            tokio::spawn(self.clone().handle_client(socket));
+            tokio::spawn(self.clone().handle_client(client_id, socket));
+            client_id += 1;
         }
     }
 
@@ -237,11 +239,8 @@ impl MainContext {
         Ok(server)
     }
 
-    #[instrument(level = "info", skip(self, socket), fields(peer = ?socket.peer_addr()))]
-    async fn handle_client(self: Arc<Self>, socket: TcpStream) -> io::Result<()> {
-        static CLIENT_ID: AtomicUsize = AtomicUsize::new(0);
-        let client_id = CLIENT_ID.fetch_add(1, Ordering::SeqCst);
-
+    #[instrument(level = "info", skip(self, socket))]
+    async fn handle_client(self: Arc<Self>, client_id: usize, socket: TcpStream) -> io::Result<()> {
         let (read, write) = socket.into_split();
 
         let mut read = BufReader::new(read);
