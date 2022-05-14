@@ -38,9 +38,14 @@ pub enum Message {
 impl fmt::Debug for Message {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Message::Request(req) => write!(f, "Request({id}: {method})", id = req.id, method = req.method),
+            Message::Request(req) => write!(
+                f,
+                "Request({id}: {method})",
+                id = req.id,
+                method = req.method
+            ),
             Message::Response(resp) => write!(f, "Response({id})", id = resp.id),
-            Message::Notification(not) => write!(f, "Notification({method})", method= not.method),
+            Message::Notification(not) => write!(f, "Notification({method})", method = not.method),
         }
     }
 }
