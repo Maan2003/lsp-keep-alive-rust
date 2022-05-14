@@ -2,6 +2,7 @@
 /// available under the MIT or Apache 2.0 licenses.
 use std::{fmt, io, path::PathBuf};
 
+use futures::stream::{unfold, Stream};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -25,6 +26,14 @@ pub fn get_root_path(init: &Message) -> Option<PathBuf> {
         }
     };
     Some(PathBuf::from(root))
+}
+
+pub fn read_messages(
+    reader: &mut (impl AsyncBufRead + Unpin),
+) -> impl futures::Stream<Item = io::Result<Message>> + futures::stream::FusedStream + '_ {
+    unfold(reader, |reader| async move {
+        Message::read(reader).await.transpose().map(|x| (x, reader))
+    })
 }
 
 #[derive(Serialize, Debug, Deserialize, Clone)]

@@ -1,6 +1,8 @@
 #![feature(let_else)]
 mod lsp;
 
+use futures::prelude::*;
+use futures::stream::FusedStream;
 use lsp::RequestId;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -28,7 +30,7 @@ pub struct MainContext {
 pub struct Server {
     id: usize,
     stdin: tokio::process::ChildStdin,
-    stdout: BufReader<tokio::process::ChildStdout>,
+    stdout: Option<BufReader<tokio::process::ChildStdout>>,
     child: tokio::process::Child,
     root: PathBuf,
     next_request_id: i32,
@@ -52,7 +54,7 @@ impl Server {
         Ok(Self {
             id,
             stdin,
-            stdout: BufReader::new(stdout),
+            stdout: Some(BufReader::new(stdout)),
             root,
             child,
             next_request_id: 0,
@@ -65,11 +67,6 @@ impl Server {
         info!("reusing server");
         self.cancel_shutdown.take().unwrap().send(()).unwrap();
         self
-    }
-
-    #[instrument(name = "Server::read_message", level = "trace", skip_all, ret)]
-    pub async fn read_message(&mut self) -> io::Result<Option<lsp::Message>> {
-        lsp::Message::read(&mut self.stdout).await
     }
 
     pub fn next_request_id(&mut self) -> RequestId {
@@ -87,7 +84,7 @@ impl Server {
 #[derive(Debug)]
 pub struct Client {
     write: OwnedWriteHalf,
-    read: BufReader<OwnedReadHalf>,
+    read: Option<BufReader<OwnedReadHalf>>,
 }
 
 impl Client {
@@ -95,18 +92,13 @@ impl Client {
         let (read, write) = socket.into_split();
         Self {
             write,
-            read: BufReader::new(read),
+            read: Some(BufReader::new(read)),
         }
     }
 
     pub async fn send_message(&mut self, message: &lsp::Message) -> io::Result<()> {
         tracing::trace!(?message, "sending message to client");
         message.write(&mut self.write).await
-    }
-
-    #[instrument(name = "Client::read_message", level = "trace", skip_all, ret)]
-    pub async fn read_message(&mut self) -> io::Result<Option<lsp::Message>> {
-        lsp::Message::read(&mut self.read).await
     }
 }
 
@@ -136,24 +128,15 @@ impl MainContext {
         }
     }
 
-    #[instrument(level = "info", skip(self, socket))]
-    async fn handle_client(self: Arc<Self>, client_id: usize, socket: TcpStream) -> io::Result<()> {
-        info!("new client");
-        let mut client = Client::new(socket);
-
-        let Some(init) = client.read_message().await? else {
-            error!("client disconnected before initialization");
-            return Ok(());
-        };
-
-        let Some(root) = lsp::get_root_path(&init) else {
-            error!("client sent invalid initialization");
-            return Ok(());
-        };
-
-        info!(?root);
-        let mut server = self.find_or_spawn_server(&root).await?;
-        let root = server.root.clone();
+    async fn handle_messages(
+        server: &mut Server,
+        client: &mut Client,
+        server_messages: impl Stream<Item = io::Result<lsp::Message>> + FusedStream,
+        client_messages: impl Stream<Item = io::Result<lsp::Message>> + FusedStream,
+        init: lsp::Message,
+    ) -> io::Result<()> {
+        futures::pin_mut!(server_messages);
+        futures::pin_mut!(client_messages);
 
         // server is already initialized, so we just send the initialization response
         // this relies on client sending similar initialization message every time
@@ -161,7 +144,7 @@ impl MainContext {
             client.send_message(init_response).await?;
         } else {
             server.send_message(init).await?;
-            let Some(init_response) = server.read_message().await? else {
+            let Some(init_response) = server_messages.next().await.transpose()? else {
                 error!("server disconnected before initialization response");
                 return Ok(());
             };
@@ -172,9 +155,9 @@ impl MainContext {
         info!("client initialized");
         let mut request_ids_map = HashMap::new();
         loop {
-            tokio::select! {
-                client_msg = client.read_message() => {
-                    let Some(mut client_msg) = client_msg? else {
+            futures::select! {
+                client_msg = client_messages.next() => {
+                    let Some(mut client_msg) = client_msg.transpose()? else {
                         warn!("client exited without sending shutdown");
                         break;
                     };
@@ -195,8 +178,8 @@ impl MainContext {
 
                     server.send_message(client_msg).await?;
                 },
-                server_msg = server.read_message() => {
-                    let Some(mut server_msg) = server_msg? else {
+                server_msg = server_messages.next() => {
+                    let Some(mut server_msg) = server_msg.transpose()? else {
                         error!("server disconnected");
                         return Ok(());
                     };
@@ -212,8 +195,47 @@ impl MainContext {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[instrument(level = "info", skip(self, socket), err)]
+    async fn handle_client(self: Arc<Self>, client_id: usize, socket: TcpStream) -> io::Result<()> {
+        info!("new client");
+        let mut client = Client::new(socket);
+
+        let mut client_reader = client.read.take().unwrap();
+        let client_messages = lsp::read_messages(&mut client_reader);
+        futures::pin_mut!(client_messages);
+
+        let Some(init) = client_messages.next().await.transpose()? else {
+            error!("client disconnected before initialization");
+            return Ok(());
+        };
+
+        let Some(root) = lsp::get_root_path(&init) else {
+            error!("client sent invalid initialization");
+            return Ok(());
+        };
+
+        info!(?root);
+
+        let mut server = self.find_or_spawn_server(&root).await?;
+        let root = server.root.clone();
+        let mut server_stdout = server.stdout.take().unwrap();
+        let server_messages = lsp::read_messages(&mut server_stdout);
+
+        Self::handle_messages(
+            &mut server,
+            &mut client,
+            server_messages,
+            client_messages,
+            init,
+        )
+        .await?;
+
         info!("client disconnected, scheduling shutdown");
 
+        server.stdout = Some(server_stdout);
         let (tx, rx) = oneshot::channel();
         server.cancel_shutdown = Some(tx);
         let server_id = server.id;
