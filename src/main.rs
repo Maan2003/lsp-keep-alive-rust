@@ -24,6 +24,7 @@ pub struct MainContext {
     servers: Mutex<Vec<Server>>,
 }
 
+#[derive(Debug)]
 pub struct Server {
     id: usize,
     stdin: tokio::process::ChildStdin,
@@ -35,15 +36,10 @@ pub struct Server {
     cancel_shutdown: Option<oneshot::Sender<()>>,
 }
 
-impl Debug for Server {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Server").field("root", &self.root).finish()
-    }
-}
-
 impl Server {
-    #[instrument(name = "new server", level = "info")]
+    #[instrument(name = "Server::new")]
     pub fn new(root: PathBuf) -> io::Result<Self> {
+        info!("spawning new server");
         static SERVER_ID: AtomicUsize = AtomicUsize::new(0);
         let id = SERVER_ID.fetch_add(1, Ordering::SeqCst);
 
@@ -136,6 +132,7 @@ impl MainContext {
 
     #[instrument(level = "info", skip(self, socket))]
     async fn handle_client(self: Arc<Self>, client_id: usize, socket: TcpStream) -> io::Result<()> {
+        info!("new client");
         let mut client = Client::new(socket);
 
         let Some(init) = client.read_message().await? else {
@@ -148,6 +145,7 @@ impl MainContext {
             return Ok(());
         };
 
+        info!(?root);
         let mut server = self.find_or_spawn_server(&root).await?;
         let root = server.root.clone();
 
@@ -165,13 +163,18 @@ impl MainContext {
             server.initialize_response = Some(init_response);
         }
 
+        info!("client initialized");
         let mut request_ids_map = HashMap::new();
         loop {
             tokio::select! {
                 client_msg = client.read_message() => {
-                    let Some(mut client_msg) = client_msg? else { break; };
+                    let Some(mut client_msg) = client_msg? else {
+                        warn!("client exited without sending shutdown");
+                        break;
+                    };
                     match &mut client_msg {
                         lsp::Message::Request(req) if req.method == "shutdown" => {
+                            info!("received shutdown request");
                             let response = lsp::Message::Response(lsp::Response::new_ok(req.id.clone(), serde_json::json!(null)));
                             client.send_message(&response).await?;
                             break;
@@ -187,7 +190,10 @@ impl MainContext {
                     server.send_message(client_msg).await?;
                 },
                 server_msg = server.read_message() => {
-                    let Some(mut server_msg) = server_msg? else { return Ok(()); };
+                    let Some(mut server_msg) = server_msg? else {
+                        error!("server disconnected");
+                        return Ok(());
+                    };
                     if let lsp::Message::Response(res) = &mut server_msg {
                         if let Some(request_id) = request_ids_map.remove(&res.id) {
                             res.id = request_id;
@@ -200,7 +206,7 @@ impl MainContext {
                 }
             }
         }
-        // client disconnected
+        info!("client disconnected, scheduling shutdown");
 
         let (tx, rx) = oneshot::channel();
         server.cancel_shutdown = Some(tx);
@@ -231,9 +237,7 @@ impl MainContext {
 #[tokio::main]
 async fn main() -> io::Result<()> {
     use tracing_subscriber::fmt::format::FmtSpan;
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_target(false)
-        .pretty();
+    let fmt_layer = tracing_subscriber::fmt::layer().with_target(false).pretty();
     let filter_layer = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new("info"))
         .unwrap();
