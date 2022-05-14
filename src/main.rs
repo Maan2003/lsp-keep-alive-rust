@@ -5,11 +5,14 @@ use lsp::RequestId;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 use std::{io, sync::Arc};
 use tokio::fs;
 use tokio::io::BufReader;
-use tracing::{error, info, instrument, Value};
+use tokio::net::tcp::OwnedReadHalf;
+use tokio::time::sleep;
+use tracing::{error, info, instrument, warn};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
@@ -18,15 +21,16 @@ use tokio::net::{tcp::OwnedWriteHalf, TcpListener, TcpStream};
 use tokio::sync::{oneshot, Mutex};
 
 pub struct MainContext {
-    servers: Mutex<Vec<Arc<Mutex<Server>>>>,
+    servers: Mutex<Vec<Server>>,
 }
 
 pub struct Server {
+    id: usize,
     stdin: tokio::process::ChildStdin,
+    stdout: BufReader<tokio::process::ChildStdout>,
     child: tokio::process::Child,
     root: PathBuf,
-    clients: Vec<Client>,
-    request_id_to_original: HashMap<RequestId, ClientRequestId>,
+    next_request_id: i32,
     initialize_response: Option<lsp::Message>,
     cancel_shutdown: Option<oneshot::Sender<()>>,
 }
@@ -37,175 +41,70 @@ impl Debug for Server {
     }
 }
 
-pub struct ClientRequestId {
-    client_id: usize,
-    request_id: RequestId,
-}
-
 impl Server {
     #[instrument(name = "new server", level = "info")]
-    pub fn new(root: PathBuf) -> io::Result<Arc<Mutex<Self>>> {
+    pub fn new(root: PathBuf) -> io::Result<Self> {
+        static SERVER_ID: AtomicUsize = AtomicUsize::new(0);
+        let id = SERVER_ID.fetch_add(1, Ordering::SeqCst);
+
         let mut process = tokio::process::Command::new("rust-analyzer");
         process.stdin(std::process::Stdio::piped());
         process.stdout(std::process::Stdio::piped());
         let mut child = process.spawn()?;
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
-        // TODO: consider using a buffered writer
-        let this = Arc::new(Mutex::new(Self {
+        Ok(Self {
+            id,
             stdin,
+            stdout: BufReader::new(stdout),
             root,
             child,
-            clients: Vec::new(),
-            request_id_to_original: HashMap::new(),
+            next_request_id: 0,
             initialize_response: None,
             cancel_shutdown: None,
-        }));
-
-        tokio::spawn(Self::handle_server_output(this.clone(), stdout));
-
-        Ok(this)
+        })
     }
 
-    #[instrument(
-        level = "info",
-        skip_all,
-        fields(
-            server_root = ?self.root,
-            client_id = client.id,
-        )
-    )]
-    pub fn attach_client(&mut self, client: Client) {
-        self.clients.push(client);
-        if let Some(cancel_shutdown) = self.cancel_shutdown.take() {
-            cancel_shutdown.send(()).unwrap();
-        }
+    #[instrument(name = "Server::read_message", level = "trace", skip_all, ret)]
+    pub async fn read_message(&mut self) -> io::Result<Option<lsp::Message>> {
+        lsp::Message::read(&mut self.stdout).await
     }
 
-    pub async fn handle_server_output(
-        this: Arc<Mutex<Self>>,
-        stdout: tokio::process::ChildStdout,
-    ) -> io::Result<()> {
-        let mut reader = BufReader::new(stdout);
-        while let Some(line) = lsp::Message::read(&mut reader).await? {
-            this.lock().await.handle_server_message(line).await.ok();
-        }
-        let this = this.lock().await;
-        info!(server_root = ?this.root, "lsp server exited");
-        Ok(())
+    pub fn next_request_id(&mut self) -> RequestId {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        id.into()
     }
 
-    #[instrument(level = "trace", skip(self))]
-    pub async fn handle_server_message(&mut self, mut message: lsp::Message) -> io::Result<()> {
-        let client_id = match &mut message {
-            lsp::Message::Request(_) | lsp::Message::Notification(_) => None,
-            lsp::Message::Response(res) => {
-                let orig_req = self.request_id_to_original.remove(&res.id);
-                if let Some(orig_req) = orig_req {
-                    res.id = orig_req.request_id;
-                    Some(orig_req.client_id)
-                } else {
-                    None
-                }
-            }
-        };
-
-        if let Some(client_id) = client_id {
-            for client in &mut self.clients {
-                if client.id == client_id {
-                    client.send_message(&message).await.ok();
-                    break;
-                }
-            }
-        } else {
-            for client in &mut self.clients {
-                client.send_message(&message).await.ok();
-            }
-        }
-        if self.initialize_response.is_none() {
-            self.initialize_response = Some(message);
-        }
-
-        Ok(())
-    }
-
-    #[instrument(level = "info", skip(this, main_ctx))]
-    pub async fn handle_disconnect(
-        this: Arc<Mutex<Self>>,
-        main_ctx: Arc<MainContext>,
-        client_id: usize,
-    ) {
-        let mut this_lock = this.lock().await;
-        this_lock.clients.retain(|client| client.id != client_id);
-        this_lock
-            .request_id_to_original
-            .retain(|_, v| v.client_id != client_id);
-
-        if this_lock.clients.is_empty() {
-            info!(server_root = ?this_lock.root, "no clients left, scheduling shutting down");
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            this_lock.cancel_shutdown = Some(tx);
-            drop(this_lock);
-            tokio::spawn(async move {
-                let sleep = tokio::time::sleep(std::time::Duration::from_secs(20 * 60));
-                tokio::select! {
-                    _ = sleep => {
-                        {
-                            let mut this = this.lock().await;
-                            info!(server_root = ?this.root, "shutting down server due to inactivity");
-                            this.child.kill().await.ok();
-                        }
-                        main_ctx.servers.lock().await.retain(|s| !Arc::ptr_eq(s, &this));
-                    },
-                    _ = rx => {
-                        let this = this.lock().await;
-                        info!(server_root = ?this.root,"shutting down cancelled");
-                    }
-                };
-            });
-        }
-    }
-
-    pub fn get_next_id(&mut self, client_id: usize) -> RequestId {
-        static NEXT_ID: AtomicI32 = AtomicI32::new(0);
-        NEXT_ID.fetch_add(1, Ordering::SeqCst).into()
-    }
-
-    #[instrument(level = "trace", skip(self, client_id))]
-    pub async fn handle_client_message(
-        &mut self,
-        client_id: usize,
-        mut message: lsp::Message,
-    ) -> io::Result<()> {
-        if let lsp::Message::Request(req) = &mut message {
-            let request_id = self.get_next_id(client_id);
-            self.request_id_to_original.insert(
-                request_id.clone(),
-                ClientRequestId {
-                    client_id,
-                    request_id: req.id.clone(),
-                },
-            );
-            req.id = request_id;
-        }
+    pub async fn send_message(&mut self, message: lsp::Message) -> io::Result<()> {
+        tracing::trace!(?message, "sending message to server");
         message.write(&mut self.stdin).await
     }
 }
 
+#[derive(Debug)]
 pub struct Client {
-    id: usize,
     write: OwnedWriteHalf,
-}
-
-impl Debug for Client {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("Client").field(&self.id).finish()
-    }
+    read: BufReader<OwnedReadHalf>,
 }
 
 impl Client {
+    pub fn new(socket: TcpStream) -> Self {
+        let (read, write) = socket.into_split();
+        Self {
+            write,
+            read: BufReader::new(read),
+        }
+    }
+
     pub async fn send_message(&mut self, message: &lsp::Message) -> io::Result<()> {
+        tracing::trace!(?message, "sending message to client");
         message.write(&mut self.write).await
+    }
+
+    #[instrument(name = "Client::read_message", level = "trace", skip_all, ret)]
+    pub async fn read_message(&mut self) -> io::Result<Option<lsp::Message>> {
+        lsp::Message::read(&mut self.read).await
     }
 }
 
@@ -226,26 +125,20 @@ impl MainContext {
         }
     }
 
-    async fn find_or_make_server(&self, root: &Path) -> io::Result<Arc<Mutex<Server>>> {
+    async fn find_or_spawn_server(&self, root: &Path) -> io::Result<Server> {
         let root = fs::canonicalize(root).await?;
         let mut servers = self.servers.lock().await;
-        for server in &*servers {
-            if server.lock().await.root == root {
-                return Ok(server.clone());
-            }
+        match servers.iter().position(|s| s.root == root) {
+            Some(idx) => Ok(servers.swap_remove(idx)),
+            None => Server::new(root),
         }
-        let server = Server::new(root)?;
-        servers.push(server.clone());
-        Ok(server)
     }
 
     #[instrument(level = "info", skip(self, socket))]
     async fn handle_client(self: Arc<Self>, client_id: usize, socket: TcpStream) -> io::Result<()> {
-        let (read, write) = socket.into_split();
+        let mut client = Client::new(socket);
 
-        let mut read = BufReader::new(read);
-
-        let Some(init) = lsp::Message::read(&mut read).await? else {
+        let Some(init) = client.read_message().await? else {
             error!("client disconnected before initialization");
             return Ok(());
         };
@@ -255,50 +148,82 @@ impl MainContext {
             return Ok(());
         };
 
-        let server = self.find_or_make_server(&root).await?;
-        let mut client = Client {
-            id: client_id,
-            write,
-        };
+        let mut server = self.find_or_spawn_server(&root).await?;
+        let root = server.root.clone();
+
+        // server is already initialized, so we just send the initialization response
+        // this relies on client sending similar initialization message every time
+        if let Some(init_response) = &server.initialize_response {
+            client.send_message(init_response).await?;
+        } else {
+            server.send_message(init).await?;
+            let Some(init_response) = server.read_message().await? else {
+                error!("server disconnected before initialization response");
+                return Ok(());
+            };
+            client.send_message(&init_response).await?;
+            server.initialize_response = Some(init_response);
+        }
+
+        let mut request_ids_map = HashMap::new();
+        loop {
+            tokio::select! {
+                client_msg = client.read_message() => {
+                    let Some(mut client_msg) = client_msg? else { break; };
+                    match &mut client_msg {
+                        lsp::Message::Request(req) if req.method == "shutdown" => {
+                            let response = lsp::Message::Response(lsp::Response::new_ok(req.id.clone(), serde_json::json!(null)));
+                            client.send_message(&response).await?;
+                            break;
+                        },
+                        lsp::Message::Request(req) => {
+                            let request_id = server.next_request_id();
+                            request_ids_map.insert(request_id.clone(), req.id.clone());
+                            req.id = request_id;
+                        },
+                        _ => {}
+                    }
+
+                    server.send_message(client_msg).await?;
+                },
+                server_msg = server.read_message() => {
+                    let Some(mut server_msg) = server_msg? else { return Ok(()); };
+                    if let lsp::Message::Response(res) = &mut server_msg {
+                        if let Some(request_id) = request_ids_map.remove(&res.id) {
+                            res.id = request_id;
+                        } else {
+                            error!("server sent response with unknown request id");
+                        }
+                    }
+                    // TODO: update message
+                    client.send_message(&server_msg).await?;
+                }
+            }
+        }
+        // client disconnected
+
+        let (tx, rx) = oneshot::channel();
+        server.cancel_shutdown = Some(tx);
+        let server_id = server.id;
+
         {
-            let mut server = server.lock().await;
-            if let Some(init) = &server.initialize_response {
-                client.send_message(init).await.ok();
-                server.attach_client(client);
-            } else {
-                server.attach_client(client);
-                server.handle_client_message(client_id, init).await.ok();
-            }
+            let mut servers = self.servers.lock().await;
+            servers.push(server);
         }
-        while let Some(message) = lsp::Message::read(&mut read).await? {
-            match message {
-                lsp::Message::Request(req) if req.method == "shutdown" => {
-                    info!(client_id, "shutdown request");
-                    let mut server = server.lock().await;
-                    let msg = lsp::Message::Response(lsp::Response {
-                        id: req.id,
-                        result: Some(serde_json::json!(null)),
-                        error: None,
-                    });
-                    let client = server
-                        .clients
-                        .iter_mut()
-                        .find(|client| client.id == client_id)
-                        .unwrap();
-                    client.send_message(&msg).await.ok();
-                    continue;
-                }
-                lsp::Message::Notification(notif) if notif.method == "exit" => {
-                    info!(client_id, "exit notification");
-                    Server::handle_disconnect(server, self.clone(), client_id).await;
-                    drop(read);
-                    break;
-                }
-                _ => {}
+
+        tokio::select! {
+            _ = sleep(Duration::from_secs(20 * 60)) => {
+                let mut servers = self.servers.lock().await;
+                let i = servers.iter().position(|s| s.id == server_id).expect("server not found");
+                let mut server = servers.swap_remove(i);
+                info!(server_root = ?server.root, "shutting down server due to inactivity");
+                server.child.kill().await.ok();
+            },
+            _ = rx => {
+                info!(server_root = ?root, "shutting down cancelled");
             }
-            let mut server = server.lock().await;
-            server.handle_client_message(client_id, message).await?;
-        }
+        };
+
         Ok(())
     }
 }
@@ -307,7 +232,6 @@ impl MainContext {
 async fn main() -> io::Result<()> {
     use tracing_subscriber::fmt::format::FmtSpan;
     let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_span_events(FmtSpan::NEW)
         .with_target(false)
         .pretty();
     let filter_layer = EnvFilter::try_from_default_env()

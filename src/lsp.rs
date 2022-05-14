@@ -27,27 +27,12 @@ pub fn get_root_path(init: &Message) -> Option<PathBuf> {
     Some(PathBuf::from(root))
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Debug, Deserialize, Clone)]
 #[serde(untagged)]
 pub enum Message {
     Request(Request),
     Response(Response),
     Notification(Notification),
-}
-
-impl fmt::Debug for Message {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Message::Request(req) => write!(
-                f,
-                "Request({id}: {method})",
-                id = req.id,
-                method = req.method
-            ),
-            Message::Response(resp) => write!(f, "Response({id})", id = resp.id),
-            Message::Notification(not) => write!(f, "Notification({method})", method = not.method),
-        }
-    }
 }
 
 impl From<Request> for Message {
