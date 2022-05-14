@@ -308,6 +308,7 @@ async fn main() -> io::Result<()> {
     use tracing_subscriber::fmt::format::FmtSpan;
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_span_events(FmtSpan::NEW)
+        .with_target(false)
         .pretty();
     let filter_layer = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new("info"))
