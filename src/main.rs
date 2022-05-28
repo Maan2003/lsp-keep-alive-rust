@@ -1,5 +1,6 @@
 #![feature(let_else)]
 mod lsp;
+mod buf_mgr;
 
 use futures::prelude::*;
 use futures::stream::FusedStream;
@@ -21,6 +22,8 @@ use tracing_subscriber::EnvFilter;
 
 use tokio::net::{tcp::OwnedWriteHalf, TcpListener, TcpStream};
 use tokio::sync::{oneshot, Mutex};
+
+use crate::buf_mgr::BufMgr;
 
 pub struct MainContext {
     servers: Mutex<Vec<Server>>,
@@ -138,6 +141,8 @@ impl MainContext {
         futures::pin_mut!(server_messages);
         futures::pin_mut!(client_messages);
 
+        let mut buf_mgr = BufMgr::new();
+
         // server is already initialized, so we just send the initialization response
         // this relies on client sending similar initialization message every time
         if let Some(init_response) = &server.initialize_response {
@@ -166,6 +171,8 @@ impl MainContext {
                             info!("received shutdown request");
                             let response = lsp::Message::Response(lsp::Response::new_ok(req.id.clone(), serde_json::json!(null)));
                             client.send_message(&response).await?;
+                            // Close the opened documents
+                            buf_mgr.client_exit(server).await?;
                             break;
                         },
                         lsp::Message::Request(req) => {
@@ -175,7 +182,7 @@ impl MainContext {
                         },
                         _ => {}
                     }
-
+                    buf_mgr.client_message(&client_msg);
                     server.send_message(client_msg).await?;
                 },
                 server_msg = server_messages.next() => {
