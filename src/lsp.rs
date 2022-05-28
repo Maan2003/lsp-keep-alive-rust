@@ -261,11 +261,10 @@ async fn read_msg_text(inp: &mut (impl AsyncBufRead + Unpin)) -> io::Result<Opti
         if buf.is_empty() {
             break;
         }
-        let mut parts = buf.splitn(2, ": ");
-        let header_name = parts.next().unwrap();
-        let header_value = parts
-            .next()
+        let (header_name, header_value) = buf
+            .split_once(": ")
             .ok_or_else(|| invalid_data!("malformed header: {:?}", buf))?;
+
         if header_name == "Content-Length" {
             size = Some(header_value.parse::<usize>().map_err(invalid_data)?);
         }
