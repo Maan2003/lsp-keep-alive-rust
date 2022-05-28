@@ -2,7 +2,7 @@
 /// available under the MIT or Apache 2.0 licenses.
 use std::{fmt, io, path::PathBuf};
 
-use futures::stream::{unfold, Stream};
+use futures::stream::unfold;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
